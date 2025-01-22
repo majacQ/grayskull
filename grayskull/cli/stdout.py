@@ -1,13 +1,13 @@
 import re
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Dict
 
 import progressbar
 from colorama import Fore, Style
 
 from grayskull.base.pkg_info import is_pkg_available
 from grayskull.cli import WIDGET_BAR_DOWNLOAD, CLIConfig
+from grayskull.utils import RE_PEP725_PURL
 
 
 def print_msg(msg: str):
@@ -19,7 +19,9 @@ def print_msg(msg: str):
 def manage_progressbar(*, max_value: int, prefix: str):
     if CLIConfig().stdout:
         with progressbar.ProgressBar(
-            widgets=deepcopy(WIDGET_BAR_DOWNLOAD), max_value=max_value, prefix=prefix,
+            widgets=deepcopy(WIDGET_BAR_DOWNLOAD),
+            max_value=max_value,
+            prefix=prefix,
         ) as bar:
             yield bar
     else:
@@ -58,12 +60,11 @@ def progressbar_with_status(max_value: int):
         yield DisabledBar()
 
 
-def print_requirements(all_requirements: Dict):
-    if not CLIConfig().stdout:
-        return
-
-    re_search = re.compile(r"^\s*([a-z0-9\.\-\_]+)(.*)", re.IGNORECASE | re.DOTALL)
+def print_requirements(
+    requirements: dict[str, list[str]], optional_requirements: dict[str, list[str]]
+) -> set:
     all_missing_deps = set()
+    re_search = re.compile(r"^\s*([a-z0-9\.\-\_]+)(.*)", re.IGNORECASE | re.DOTALL)
 
     def print_req(list_pkg):
         if isinstance(list_pkg, str):
@@ -77,6 +78,11 @@ def print_requirements(all_requirements: Dict):
                 pkg_name = pkg.replace("<{", "{{")
                 options = ""
                 colour = Fore.GREEN
+            elif RE_PEP725_PURL.match(pkg):
+                pkg_name = pkg
+                options = ""
+                all_missing_deps.add(pkg)
+                colour = Fore.YELLOW
             elif search_result:
                 pkg_name, options = search_result.groups()
                 if is_pkg_available(pkg_name):
@@ -88,17 +94,31 @@ def print_requirements(all_requirements: Dict):
                 continue
             print_msg(f"  - {colour}{Style.BRIGHT}{pkg_name}{Style.RESET_ALL}{options}")
 
-    if all_requirements.get("build"):
-        print_msg("Build requirements:")
-        print_req(sorted(all_requirements.get("build", [])))
-    print_msg("Host requirements:")
-    print_req(sorted(all_requirements.get("host", [])))
-    print_msg("\nRun requirements:")
-    print_req(sorted(all_requirements.get("run", [])))
-    print_msg(f"\n{Fore.RED}RED{Style.RESET_ALL}: Missing packages")
+    keys = ["build", "host", "run"]
+    for key in keys:
+        print_msg(f"{key.capitalize()} requirements:")
+        req_list = requirements.get(key, [])
+        if req_list:
+            print_req(req_list)
+        else:
+            print_msg("  <none>")
+
+    for key, req_list in optional_requirements.items():
+        print_msg(f"{key.capitalize()} requirements (optional):")
+        print_req(req_list)
+
+    print_msg(
+        f"\n{Fore.RED}RED{Style.RESET_ALL}: Package names not available on conda-forge"
+    )
+    print_msg(
+        f"{Fore.YELLOW}YELLOW{Style.RESET_ALL}: "
+        "PEP-725 PURLs that did not map to known package"
+    )
     print_msg(f"{Fore.GREEN}GREEN{Style.RESET_ALL}: Packages available on conda-forge")
+
     if CLIConfig().list_missing_deps:
         if all_missing_deps:
             print_msg(f"Missing dependencies: {', '.join(all_missing_deps)}")
         else:
             print_msg("All dependencies are already on conda-forge.")
+    return all_missing_deps

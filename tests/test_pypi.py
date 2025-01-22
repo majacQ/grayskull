@@ -2,13 +2,53 @@ import hashlib
 import json
 import os
 import sys
+from unittest.mock import patch
 
 import pytest
 from colorama import Fore, Style
+from souschef.jinja_expression import get_global_jinja_var
+from souschef.recipe import Recipe
 
+from grayskull.base.factory import GrayskullFactory
+from grayskull.base.pkg_info import normalize_pkg_name
 from grayskull.cli import CLIConfig
-from grayskull.pypi import PyPi
-from grayskull.pypi.pypi import clean_deps_for_conda_forge
+from grayskull.cli.parser import parse_pkg_name_version
+from grayskull.config import Configuration
+from grayskull.main import create_python_recipe
+from grayskull.strategy.py_base import (
+    clean_deps_for_conda_forge,
+    generic_py_ver_to,
+    get_compilers,
+    get_entry_points_from_sdist,
+    get_extra_from_requires_dist,
+    get_name_version_from_requires_dist,
+    get_sdist_metadata,
+    get_setup_cfg,
+    get_test_entry_points,
+    get_test_imports,
+    parse_extra_metadata_to_selector,
+    py_version_to_limit_python,
+    py_version_to_selector,
+    update_requirements_with_pin,
+)
+from grayskull.strategy.pypi import (
+    PypiStrategy,
+    check_noarch_python_for_new_deps,
+    compose_test_section,
+    extract_optional_requirements,
+    extract_requirements,
+    get_all_selectors_pypi,
+    get_pypi_metadata,
+    get_sha256_from_pypi_metadata,
+    get_url_filename,
+    merge_pypi_sdist_metadata,
+    normalize_requirements_list,
+    remove_all_inner_nones,
+    remove_selectors_pkgs_if_needed,
+    sort_reqs,
+    update_recipe,
+)
+from grayskull.utils import PyVer, format_dependencies, generate_recipe
 
 
 @pytest.fixture
@@ -20,10 +60,61 @@ def pypi_metadata():
         return json.load(f)
 
 
-def test_extract_pypi_requirements(pypi_metadata):
-    recipe = PyPi(name="pytest", version="5.3.1")
-    pypi_reqs = recipe._extract_requirements(pypi_metadata["info"])
-    assert sorted(pypi_reqs["host"]) == sorted(["python", "pip"])
+@pytest.fixture
+def freeze_py_cf_supported():
+    return [
+        PyVer(3, 6),
+        PyVer(3, 7),
+        PyVer(3, 8),
+        PyVer(3, 9),
+        PyVer(3, 10),
+        PyVer(3, 11),
+    ]
+
+
+@pytest.fixture
+def recipe_config():
+    config = Configuration(
+        name="pytest",
+        py_cf_supported=[
+            PyVer(3, 6),
+            PyVer(3, 7),
+            PyVer(3, 8),
+            PyVer(3, 9),
+            PyVer(3, 10),
+            PyVer(3, 11),
+            PyVer(3, 12),
+        ],
+        supported_py=[
+            PyVer(2, 7),
+            PyVer(3, 6),
+            PyVer(3, 7),
+            PyVer(3, 8),
+            PyVer(3, 9),
+            PyVer(3, 10),
+            PyVer(3, 11),
+        ],
+    )
+    recipe = Recipe(name="pytest")
+    return recipe, config
+
+
+@pytest.fixture
+def pypi_metadata_with_extras():
+    path_metadata = os.path.join(
+        os.path.dirname(__file__), "data", "pypi_dask_metadata.json"
+    )
+    with open(path_metadata) as f:
+        return json.load(f)
+
+
+def test_extract_pypi_requirements(pypi_metadata, recipe_config):
+    recipe, config = recipe_config
+    pypi_metadata["info"]["setup_requires"] = ["tomli >1.0.0 ; python_version >=3.11"]
+    pypi_reqs = extract_requirements(pypi_metadata["info"], config, recipe)
+    assert sorted(pypi_reqs["host"]) == sorted(
+        ["python", "pip", "tomli >1.0.0  # [py>=311]"]
+    )
     assert sorted(pypi_reqs["run"]) == sorted(
         [
             "python",
@@ -36,37 +127,46 @@ def test_extract_pypi_requirements(pypi_metadata):
             "pathlib2 >=2.2.0  # [py<36]",
             "importlib-metadata >=0.12  # [py<38]",
             "atomicwrites >=1.0  # [win]",
-            "colorama   # [win]",
+            "colorama  # [win]",
         ]
     )
 
 
 def test_get_pypi_metadata(pypi_metadata):
-    recipe = PyPi(name="pytest", version="5.3.1", is_strict_cf=True)
-    metadata = recipe._get_pypi_metadata(name="pytest", version="5.3.1")
+    recipe = Recipe(name="pytest")
+    config = Configuration(name="pytest", version="5.3.1", is_strict_cf=True)
+    metadata = get_pypi_metadata(config)
+    PypiStrategy.fetch_data(recipe, config)
     assert metadata["name"] == "pytest"
     assert metadata["version"] == "5.3.1"
     assert "pathlib2 >=2.2.0  # [py<36]" not in recipe["requirements"]["run"]
 
 
 def test_get_name_version_from_requires_dist():
-    assert PyPi._get_name_version_from_requires_dist("py (>=1.5.0)") == (
+    assert get_name_version_from_requires_dist("py (>=1.5.0)") == (
         "py",
         ">=1.5.0",
     )
 
 
 def test_get_extra_from_requires_dist():
-    assert PyPi._get_extra_from_requires_dist(' python_version < "3.6"') == [
-        ("", "python_version", "<", "3.6", "", "",)
+    assert get_extra_from_requires_dist(' python_version < "3.6"') == [
+        (
+            "",
+            "python_version",
+            "<",
+            "3.6",
+            "",
+            "",
+        )
     ]
-    assert PyPi._get_extra_from_requires_dist(
+    assert get_extra_from_requires_dist(
         " python_version < \"3.6\" ; extra =='test'"
     ) == [
         ("", "python_version", "<", "3.6", "", ""),
         ("", "extra", "==", "test", "", ""),
     ]
-    assert PyPi._get_extra_from_requires_dist(
+    assert get_extra_from_requires_dist(
         ' (sys_platform =="win32" and python_version =="2.7") and extra =="socks"'
     ) == [
         ("(", "sys_platform", "==", "win32", "", "and"),
@@ -75,51 +175,370 @@ def test_get_extra_from_requires_dist():
     ]
 
 
-def test_get_all_selectors_pypi():
-    recipe = PyPi(name="pytest", version="5.3.1")
-    assert recipe._get_all_selectors_pypi(
+@pytest.fixture(scope="module")
+def dask_sdist_metadata():
+    config = Configuration(name="dask")
+    return get_sdist_metadata(
+        "https://pypi.org/packages/source/d/dask/dask-2022.6.1.tar.gz",
+        config,
+    )
+
+
+def test_get_extra_requirements(dask_sdist_metadata):
+    received = {
+        extra: set(req_lst)
+        for extra, req_lst in dask_sdist_metadata["extras_require"].items()
+    }
+    expected = {
+        "array": {"numpy >= 1.18"},
+        "bag": set(),
+        "dataframe": {"pandas >= 1.0", "numpy >= 1.18"},
+        "distributed": {"distributed == 2022.6.1"},
+        "diagnostics": {"bokeh >= 2.4.2", "jinja2"},
+        "delayed": set(),
+        "complete": {
+            "bokeh >= 2.4.2",
+            "numpy >= 1.18",
+            "distributed == 2022.6.1",
+            "pandas >= 1.0",
+            "jinja2",
+        },
+        "test": {"pytest-xdist", "pytest-rerunfailures", "pre-commit", "pytest"},
+    }
+    assert received == expected
+
+
+def test_extract_optional_requirements(dask_sdist_metadata):
+    config = Configuration(name="dask")
+
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    assert not received
+
+    all_optional_reqs = {
+        "array": {"numpy >=1.18"},
+        "complete": {
+            "distributed ==2022.6.1",
+            "pandas >=1.0",
+            "numpy >=1.18",
+            "bokeh >=2.4.2",
+            "jinja2",
+        },
+        "dataframe": {"numpy >=1.18", "pandas >=1.0"},
+        "diagnostics": {"bokeh >=2.4.2", "jinja2"},
+        "distributed": {"distributed ==2022.6.1"},
+        "test": {"pytest-xdist", "pre-commit", "pytest-rerunfailures", "pytest"},
+    }
+
+    config.extras_require_all = True
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    received = {k: set(v) for k, v in received.items()}
+    expected = {k: set(v) for k, v in all_optional_reqs.items()}
+    assert received == expected
+
+    config.extras_require_all = True
+    config.extras_require_include = None
+    config.extras_require_exclude = ["complete"]
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    received = {k: set(v) for k, v in received.items()}
+    expected = {k: set(v) for k, v in all_optional_reqs.items() if k != "complete"}
+    assert received == expected
+
+    config.extras_require_all = False
+    config.extras_require_include = ["complete"]
+    config.extras_require_exclude = None
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    received = {k: set(v) for k, v in received.items()}
+    expected = {k: set(v) for k, v in all_optional_reqs.items() if k == "complete"}
+    assert received == expected
+
+    config.extras_require_all = True
+    config.extras_require_include = ["complete"]
+    config.extras_require_exclude = None
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    received = {k: set(v) for k, v in received.items()}
+    expected = {k: set(v) for k, v in all_optional_reqs.items()}
+    assert received == expected
+
+    config.extras_require_all = True
+    config.extras_require_include = None
+    config.extras_require_exclude = ["complete", "test"]
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    received = {k: set(v) for k, v in received.items()}
+    expected = {
+        k: set(v) for k, v in all_optional_reqs.items() if k not in ("complete", "test")
+    }
+    assert received == expected
+
+    config.extras_require_all = True
+    config.extras_require_include = None
+    config.extras_require_exclude = ["complete", "test"]
+    config.extras_require_test = "test"
+    received = extract_optional_requirements(dask_sdist_metadata, config)
+    received = {k: set(v) for k, v in received.items()}
+    expected = {k: set(v) for k, v in all_optional_reqs.items() if k != "complete"}
+    assert received == expected
+
+
+def test_compose_test_section_with_console_scripts():
+    config = Configuration(name="pytest", version="7.1.2")
+    metadata1 = get_pypi_metadata(config)
+    metadata2 = get_sdist_metadata(
+        "https://pypi.org/packages/source/p/pytest/pytest-7.1.2.tar.gz", config
+    )
+    metadata = merge_pypi_sdist_metadata(metadata1, metadata2, config)
+    test_requirements = []
+    test_section = compose_test_section(metadata, test_requirements)
+    test_section = {k: set(v) for k, v in test_section.items()}
+    expected = {
+        "imports": {"pytest"},
+        "commands": {"pip check", "py.test --help", "pytest --help"},
+        "requires": {"pip"},
+    }
+    assert test_section == expected
+
+
+def test_compose_test_section_with_requirements(dask_sdist_metadata):
+    config = Configuration(name="dask", version="2022.7.1")
+    metadata = get_pypi_metadata(config)
+    test_requirements = dask_sdist_metadata["extras_require"]["test"]
+    test_section = compose_test_section(metadata, test_requirements)
+    test_section = {k: set(v) for k, v in test_section.items()}
+    expected = {
+        "imports": {"dask"},
+        "commands": {"pip check", "pytest --pyargs dask"},
+        "requires": {
+            "pip",
+            "pytest",
+            "pytest-xdist",
+            "pytest-rerunfailures",
+            "pre-commit",
+        },
+    }
+    assert test_section == expected
+
+
+def test_get_include_extra_requirements():
+    base_requirements = [
+        "cloudpickle >=1.1.1",
+        "fsspec >=0.6.0",
+        "packaging >=20.0",
+        "partd >=0.3.10",
+        "python >=3.8",
+        "pyyaml >=5.3.1",
+        "toolz >=0.8.2",
+    ]
+    host_requirements = ["python >=3.8", "pip"]
+
+    extras = {}
+    extras["array"] = ["numpy >=1.18"]
+    extras["distributed"] = ["distributed ==2022.6.1"]
+    extras["diagnostics"] = ["bokeh >=2.4.2", "jinja2"]
+    extras["dataframe"] = ["numpy >=1.18", "pandas >=1.0"]
+    extras["test"] = ["pytest-xdist", "pytest", "pytest-rerunfailures", "pre-commit"]
+    extras["complete"] = [
+        "distributed ==2022.6.1",
+        "jinja2",
+        "numpy >=1.18",
+        "bokeh >=2.4.2",
+        "pandas >=1.0",
+    ]
+
+    def set_of_strings(sequence):
+        return set(map(str, sequence))
+
+    # extras are not used
+    config = Configuration(name="dask", version="2022.6.1")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["outputs"]) == set()
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set(recipe["requirements"]["run"]) == set(base_requirements)
+    assert set(recipe["test"]["requires"]) == {"pip"}
+
+    # all extras are included in the requirements
+    config = Configuration(name="dask", version="2022.6.1", extras_require_all=True)
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["outputs"]) == set()
+
+    expected = list(base_requirements)
+    for name, req_lst in extras.items():
+        if name != "complete":
+            expected.append(f"Extra: {name}")
+            expected.extend(req_lst)
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set_of_strings(recipe["requirements"]["run"]) == set(expected)
+    assert set_of_strings(recipe["test"]["requires"]) == {"pip"}
+
+    # all extras are included in the requirements except for the
+    # test requirements which are in the test section
+    config = Configuration(
+        name="dask",
+        version="2022.6.1",
+        extras_require_all=True,
+        extras_require_test="test",
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["outputs"]) == set()
+
+    expected = list(base_requirements)
+    for name, req_lst in extras.items():
+        if name not in ("test", "complete"):
+            expected.append(f"Extra: {name}")
+            expected.extend(req_lst)
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set_of_strings(recipe["requirements"]["run"]) == set(expected)
+    assert set_of_strings(recipe["test"]["requires"]) == {"pip", *extras["test"]}
+
+    # only "array" is included in the requirements
+    config = Configuration(
+        name="dask", version="2022.6.1", extras_require_include=("array",)
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["outputs"]) == set()
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set_of_strings(recipe["requirements"]["run"]) == {
+        *base_requirements,
+        "Extra: array",
+        *extras["array"],
+    }
+    assert set_of_strings(recipe["test"]["requires"]) == {"pip"}
+
+    # only "test" is included but in the test section
+    config = Configuration(
+        name="dask",
+        version="2022.6.1",
+        extras_require_all=True,
+        extras_require_exclude=set(extras) - {"test"},
+        extras_require_test="test",
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["outputs"]) == set()
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set_of_strings(recipe["requirements"]["run"]) == set(base_requirements)
+    assert set_of_strings(recipe["test"]["requires"]) == {"pip", *extras["test"]}
+
+    # only "test" is included in the test section
+    config = Configuration(
+        name="dask",
+        version="2022.6.1",
+        extras_require_all=True,
+        extras_require_exclude=set(extras) - {"test"},
+        extras_require_test="test",
+        extras_require_split=True,
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["outputs"]) == set()
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set_of_strings(recipe["requirements"]["run"]) == set(base_requirements)
+    assert set_of_strings(recipe["test"]["requires"]) == {"pip", *extras["test"]}
+
+    # all extras have their own output except for the
+    # test requirements which are in the test section
+    config = Configuration(
+        name="dask",
+        version="2022.6.1",
+        extras_require_all=True,
+        extras_require_test="test",
+        extras_require_split=True,
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["package"]["name"] == "<{ name|lower }}"
+    assert set(recipe["requirements"]["host"]) == set(host_requirements)
+    assert set(recipe["requirements"]["run"]) == set(base_requirements)
+    assert len(recipe["outputs"]) == 6
+
+    expected = {}
+    for name, req_lst in extras.items():
+        if name != "test":
+            expected[f"dask-{name}"] = {
+                "{{ pin_subpackage('dask', exact=True) }}",
+                "python >=3.8",
+                *req_lst,
+            }
+    found = {}
+    for output in recipe["outputs"]:
+        if output["name"] == "dask":
+            assert "requirements" not in output
+        else:
+            assert set(output["requirements"]["host"]) == set(host_requirements)
+            found[output["name"]] = set_of_strings(output["requirements"]["run"])
+    assert found == expected
+
+    expected = {"pip", *extras["test"]}
+    assert set_of_strings(recipe["test"]["requires"]) == expected
+    for output in recipe["outputs"]:
+        if output["name"] == "dask":
+            assert "test" not in output
+        else:
+            assert set_of_strings(output["test"]["requires"]) == expected
+
+    expected = {"noarch": "python"}
+    for output in recipe["outputs"]:
+        if output["name"] == "dask":
+            assert "build" not in output
+        else:
+            assert output["build"] == expected
+
+
+def test_normalize_requirements_list():
+    config = Configuration(name="pytest")
+    requirements = ["pytest ~=5.3.2", "pyqt5"]
+    requirements = set(normalize_requirements_list(requirements, config))
+    expected = {"pytest >=5.3.2,<5.4.dev0", "pyqt"}
+    assert requirements == expected
+
+
+def test_get_all_selectors_pypi(recipe_config):
+    _, config = recipe_config
+    config.version = "5.3.1"
+    assert get_all_selectors_pypi(
         [
             ("(", "sys_platform", "==", "win32", "", "and"),
             ("", "python_version", "==", "2.7", ")", "and"),
             ("", "extra", "==", "socks", "", ""),
-        ]
+        ],
+        config,
     ) == ["(", "win", "and", "py==27", ")"]
 
 
 def test_get_selector():
-    assert PyPi._parse_extra_metadata_to_selector("extra", "==", "win32") == ""
-    assert (
-        PyPi._parse_extra_metadata_to_selector("sys_platform", "==", "win32") == "win"
-    )
-    assert (
-        PyPi._parse_extra_metadata_to_selector("python_version", "<", "3.6") == "py<36"
-    )
+    assert parse_extra_metadata_to_selector("extra", "==", "win32") == ""
+    assert parse_extra_metadata_to_selector("sys_platform", "==", "win32") == "win"
+    assert parse_extra_metadata_to_selector("python_version", "<", "3.6") == "py<36"
 
 
 @pytest.mark.parametrize(
     "requires_python, exp_selector, ex_cf",
     [
-        (">=3.5", "2k", None),
+        (">=3.5", "2k", "<36"),
         (">=3.6", "2k", None),
         (">=3.7", "<37", "<37"),
         ("<=3.7", ">=38", ">=38"),
         ("<=3.7.1", ">=38", ">=38"),
         ("<3.7", ">=37", ">=37"),
         (">2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*", "<36", "<36"),
-        (">=2.7, !=3.6.*", "==36", "==36"),
+        (">=2.7, !=3.6.*", "==36", "<37"),
         (">3.7", "<38", "<38"),
         (">2.7", "2k", "<36"),
         ("<3", "3k", "skip"),
         ("!=3.7", "==37", "==37"),
+        ("~=3.7", "<37", "<37"),
     ],
 )
-def test_py_version_to_selector(requires_python, exp_selector, ex_cf):
+def test_py_version_to_selector(requires_python, exp_selector, ex_cf, recipe_config):
+    config = recipe_config[1]
     metadata = {"requires_python": requires_python}
-    assert PyPi.py_version_to_selector(metadata) == f"# [py{exp_selector}]"
+    assert py_version_to_selector(metadata, config) == f"# [py{exp_selector}]"
 
     if ex_cf != "skip":
         expected = f"# [py{ex_cf}]" if ex_cf else None
-        result = PyPi.py_version_to_selector(metadata, is_strict_cf=True)
+        config.is_strict_cf = True
+        result = py_version_to_selector(metadata, config)
         if isinstance(expected, str):
             assert expected == result
         else:
@@ -129,26 +548,29 @@ def test_py_version_to_selector(requires_python, exp_selector, ex_cf):
 @pytest.mark.parametrize(
     "requires_python, exp_limit, ex_cf",
     [
-        (">=3.5", ">=3.5", None),
-        (">=3.6", ">=3.6", None),
+        (">=3.5", ">=3.5", ">=3.6"),
+        (">=3.6", ">=3.6", ">=3.6"),
         (">=3.7", ">=3.7", ">=3.7"),
         ("<=3.7", "<3.8", "<3.8"),
         ("<=3.7.1", "<3.8", "<3.8"),
         ("<3.7", "<3.7", "<3.7"),
         (">2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*", ">=3.6", ">=3.6"),
-        (">=2.7, !=3.6.*", "!=3.6", "!=3.6"),
+        (">=2.7, !=3.6.*", "!=3.6", ">=3.7"),
         (">3.7", ">=3.8", ">=3.8"),
         (">2.7", ">=3.6", ">=3.6"),
         ("<3", "<3.0", "skip"),
         ("!=3.7", "!=3.7", "!=3.7"),
+        ("~=3.7", ">=3.7", ">=3.7"),
     ],
 )
-def test_py_version_to_limit_python(requires_python, exp_limit, ex_cf):
+def test_py_version_to_limit_python(requires_python, exp_limit, ex_cf, recipe_config):
     metadata = {"requires_python": requires_python}
-    assert PyPi.py_version_to_limit_python(metadata) == f"{exp_limit}"
+    assert py_version_to_limit_python(metadata, recipe_config[1]) == f"{exp_limit}"
 
     if ex_cf != "skip":
-        result = PyPi.py_version_to_limit_python(metadata, is_strict_cf=True)
+        config = recipe_config[1]
+        config.is_strict_cf = True
+        result = py_version_to_limit_python(metadata, config)
         if isinstance(ex_cf, str):
             assert ex_cf == result
         else:
@@ -162,7 +584,7 @@ def test_get_sha256_from_pypi_metadata():
             {"packagetype": "sdist", "digests": {"sha256": "1234sha256"}},
         ]
     }
-    assert PyPi.get_sha256_from_pypi_metadata(metadata) == "1234sha256"
+    assert get_sha256_from_pypi_metadata(metadata) == "1234sha256"
 
     metadata = {
         "urls": [
@@ -171,15 +593,19 @@ def test_get_sha256_from_pypi_metadata():
         ]
     }
     with pytest.raises(AttributeError) as err:
-        PyPi.get_sha256_from_pypi_metadata(metadata)
+        get_sha256_from_pypi_metadata(metadata)
     assert err.match("Hash information for sdist was not found on PyPi metadata.")
 
 
-def test_injection_distutils():
-    recipe = PyPi(name="hypothesis", version="5.5.1")
-    data = recipe._get_sdist_metadata(
-        "https://pypi.io/packages/source/h/hypothesis/hypothesis-5.5.1.tar.gz",
-        "hypothesis",
+@pytest.mark.github
+@pytest.mark.parametrize(
+    "name", ["hypothesis", "https://github.com/HypothesisWorks/hypothesis"]
+)
+def test_injection_distutils(name):
+    config = Configuration(name="hypothesis")
+    data = get_sdist_metadata(
+        "https://pypi.org/packages/source/h/hypothesis/hypothesis-5.5.1.tar.gz",
+        config,
     )
     assert sorted(data["install_requires"]) == sorted(
         ["attrs>=19.2.0", "sortedcontainers>=2.1.0,<3.0.0"]
@@ -193,9 +619,9 @@ def test_injection_distutils():
 
 
 def test_injection_distutils_pytest():
-    recipe = PyPi(name="pytest", version="5.3.2")
-    data = recipe._get_sdist_metadata(
-        "https://pypi.io/packages/source/p/pytest/pytest-5.3.2.tar.gz", "pytest"
+    config = Configuration(name="pytest", version="5.3.2")
+    data = get_sdist_metadata(
+        "https://pypi.org/packages/source/p/pytest/pytest-5.3.2.tar.gz", config
     )
     assert sorted(data["install_requires"]) == sorted(
         [
@@ -212,37 +638,161 @@ def test_injection_distutils_pytest():
         ]
     )
     assert sorted(data["setup_requires"]) == sorted(
-        ["setuptools>=40.0", "setuptools_scm"]
+        ["setuptools-scm", "setuptools>=40.0", "wheel"]
     )
     assert not data.get("compilers")
 
 
 def test_injection_distutils_compiler_gsw():
-    recipe = PyPi(name="gsw", version="3.3.1")
-    data = recipe._get_sdist_metadata(
-        "https://pypi.io/packages/source/g/gsw/gsw-3.3.1.tar.gz", "gsw"
+    config = Configuration(name="gsw", version="3.6.19")
+    data = get_sdist_metadata(
+        "https://pypi.org/packages/source/g/gsw/gsw-3.6.19.tar.gz", config
     )
     assert data.get("compilers") == ["c"]
-    assert data["packages"] == ["gsw"]
+    assert data["name"] == "gsw"
 
 
 def test_injection_distutils_setup_reqs_ensure_list():
     pkg_name, pkg_ver = "pyinstaller-hooks-contrib", "2020.7"
-    recipe = PyPi(name=pkg_name, version=pkg_ver)
-    data = recipe._get_sdist_metadata(
-        f"https://pypi.io/packages/source/p/{pkg_name}/{pkg_name}-{pkg_ver}.tar.gz",
-        pkg_name,
+    config = Configuration(name=pkg_name, version=pkg_ver)
+    data = get_sdist_metadata(
+        f"https://pypi.org/packages/source/p/{pkg_name}/{pkg_name}-{pkg_ver}.tar.gz",
+        config,
     )
     assert data.get("setup_requires") == ["setuptools >= 30.3.0"]
 
 
 def test_merge_pypi_sdist_metadata():
-    recipe = PyPi(name="gsw", version="3.3.1")
-    pypi_metadata = recipe._get_pypi_metadata(name="gsw", version="3.3.1")
-    sdist_metadata = recipe._get_sdist_metadata(pypi_metadata["sdist_url"], "gsw")
-    merged_data = PyPi._merge_pypi_sdist_metadata(pypi_metadata, sdist_metadata)
+    config = Configuration(name="gsw", version="3.6.19")
+    pypi_metadata = get_pypi_metadata(config)
+    sdist_metadata = get_sdist_metadata(pypi_metadata["sdist_url"], config)
+    merged_data = merge_pypi_sdist_metadata(pypi_metadata, sdist_metadata, config)
     assert merged_data["compilers"] == ["c"]
-    assert sorted(merged_data["setup_requires"]) == sorted(["numpy"])
+    assert sorted(merged_data["setup_requires"]) == sorted(
+        [
+            "build",
+            'numpy<3,>=2.0.0rc1; python_version >= "3.9"',
+            'oldest-supported-numpy; python_version < "3.9"',
+            "pip>9.0.1",
+            "setuptools>=42",
+            "setuptools_scm[toml]>=3.4",
+            "wheel",
+            "python >=3.8",
+        ]
+    )
+
+
+def test_pypi_metadata_constraints_for_python_versions():
+    config = Configuration(name="apache-airflow-providers-trino", version="6.0.0")
+    pypi_metadata = get_pypi_metadata(config)
+    assert sorted(pypi_metadata["requires_dist"]) == sorted(
+        [
+            "apache-airflow-providers-common-sql>=1.20.0",
+            "apache-airflow>=2.9.0",
+            'pandas<2.2,>=1.5.3; python_version < "3.9"',
+            'pandas<2.2,>=2.1.2; python_version >= "3.9"',
+            "trino>=0.318.0",
+            'apache-airflow-providers-google; extra == "google"',
+            'apache-airflow-providers-openlineage; extra == "openlineage"',
+        ]
+    )
+
+    config = Configuration(name="databricks-sql-connector", version="3.7.0")
+    pypi_metadata = get_pypi_metadata(config)
+    assert sorted(pypi_metadata["requires_dist"]) == sorted(
+        [
+            'alembic<2.0.0,>=1.0.11; extra == "alembic"',
+            "lz4<5.0.0,>=4.0.2",
+            'numpy>=1.16.6; python_version >= "3.8" and python_version < "3.11"',
+            'numpy>=1.23.4; python_version >= "3.11"',
+            "oauthlib<4.0.0,>=3.1.0",
+            "openpyxl<4.0.0,>=3.0.10",
+            'pandas<2.3.0,>=1.2.5; python_version >= "3.8"',
+            "pyarrow>=14.0.1",
+            "requests<3.0.0,>=2.18.1",
+            'sqlalchemy>=2.0.21; extra == "sqlalchemy" or extra == "alembic"',
+            "thrift<0.21.0,>=0.16.0",
+            "urllib3>=1.26",
+        ]
+    )
+
+
+def test_sdist_metadata_from_toml_project_dependencies():
+    config = Configuration(name="apache-airflow-providers-trino", version="6.0.0")
+    pypi_metadata = get_pypi_metadata(config)
+    sdist_metadata = get_sdist_metadata(pypi_metadata["sdist_url"], config)
+    assert sorted(sdist_metadata["install_requires"]) == sorted(
+        [
+            "apache-airflow-providers-common-sql>=1.20.0",
+            "apache-airflow>=2.9.0",
+            'pandas>=1.5.3,<2.2;python_version<"3.9"',
+            'pandas>=2.1.2,<2.2;python_version>="3.9"',
+            "trino>=0.318.0",
+            "python ~=3.9",
+        ]
+    )
+
+
+def test_sdist_metadata_from_toml_poetry_dependencies():
+    config = Configuration(name="databricks-sql-connector", version="3.7.0")
+    pypi_metadata = get_pypi_metadata(config)
+    sdist_metadata = get_sdist_metadata(pypi_metadata["sdist_url"], config)
+    assert sorted(sdist_metadata["install_requires"]) == sorted(
+        [
+            "python >=3.8.0,<4.0.0",
+            "thrift >=0.16.0,<0.21.0",
+            "pandas >=1.2.5,<2.3.0  # [py>=38]",
+            "pyarrow >=14.0.1",
+            "lz4 >=4.0.2,<5.0.0",
+            "requests >=2.18.1,<3.0.0",
+            "oauthlib >=3.1.0,<4.0.0",
+            "numpy >=1.16.6  # [py>=38 and py<311]",
+            "numpy >=1.23.4  # [py>=311]",
+            "openpyxl >=3.0.10,<4.0.0",
+            "urllib3 >=1.26",
+        ]
+    )
+
+
+def test_merge_pypi_sdist_metadata_from_toml():
+    # tests merging pyproject.toml dependencies from poetry with pypi data,
+    # including multiple numpy constraints with python version selectors
+    config = Configuration(name="databricks-sql-connector", version="3.7.0")
+    pypi_metadata = get_pypi_metadata(config)
+    sdist_metadata = get_sdist_metadata(pypi_metadata["sdist_url"], config)
+    merged_data = merge_pypi_sdist_metadata(pypi_metadata, sdist_metadata, config)
+    assert sorted(merged_data["requires_dist"]) == sorted(
+        [
+            "python >=3.8.0,<4.0.0",
+            "thrift >=0.16.0,<0.21.0",
+            "pandas >=1.2.5,<2.3.0  # [py>=38]",
+            "pyarrow >=14.0.1",
+            "lz4 >=4.0.2,<5.0.0",
+            "requests >=2.18.1,<3.0.0",
+            "oauthlib >=3.1.0,<4.0.0",
+            "numpy >=1.16.6  # [py>=38 and py<311]",
+            "numpy >=1.23.4  # [py>=311]",
+            "openpyxl >=3.0.10,<4.0.0",
+            "urllib3 >=1.26",
+        ]
+    )
+
+    # tests merging pyproject.toml project dependencies with pypi data,
+    # including multiple pandas constraints with python version selectors
+    config = Configuration(name="apache-airflow-providers-trino", version="6.0.0")
+    pypi_metadata = get_pypi_metadata(config)
+    sdist_metadata = get_sdist_metadata(pypi_metadata["sdist_url"], config)
+    merged_data = merge_pypi_sdist_metadata(pypi_metadata, sdist_metadata, config)
+    assert sorted(merged_data["requires_dist"]) == sorted(
+        [
+            "apache-airflow-providers-common-sql>=1.20.0",
+            "apache-airflow>=2.9.0",
+            'pandas>=1.5.3,<2.2;python_version<"3.9"',
+            'pandas>=2.1.2,<2.2;python_version>="3.9"',
+            "trino>=0.318.0",
+            "python ~=3.9",
+        ]
+    )
 
 
 def test_update_requirements_with_pin():
@@ -251,7 +801,7 @@ def test_update_requirements_with_pin():
         "host": ["python", "numpy"],
         "run": ["python", "numpy"],
     }
-    PyPi._update_requirements_with_pin(req)
+    update_requirements_with_pin(req)
     assert req == {
         "build": ["<{ compiler('c') }}"],
         "host": ["python", "numpy"],
@@ -260,27 +810,28 @@ def test_update_requirements_with_pin():
 
 
 def test_get_compilers():
-    assert PyPi._get_compilers(["pybind11"], {}) == ["cxx"]
-    assert PyPi._get_compilers(["cython"], {}) == ["c"]
-    assert sorted(PyPi._get_compilers(["pybind11", "cython"], {})) == sorted(
+    config = Configuration(name="any_package")
+    assert get_compilers(["pybind11"], {}, config) == ["cxx"]
+    assert get_compilers(["cython"], {}, config) == ["c"]
+    assert sorted(get_compilers(["pybind11", "cython"], {}, config)) == sorted(
         ["cxx", "c"]
     )
-    assert sorted(PyPi._get_compilers(["pybind11"], {"compilers": ["c"]})) == sorted(
+    assert sorted(get_compilers(["pybind11"], {"compilers": ["c"]}, config)) == sorted(
         ["cxx", "c"]
     )
 
 
 def test_get_entry_points_from_sdist():
-    assert PyPi._get_entry_points_from_sdist({}) == []
-    assert PyPi._get_entry_points_from_sdist(
+    assert get_entry_points_from_sdist({}) == []
+    assert get_entry_points_from_sdist(
         {"entry_points": {"console_scripts": ["console_scripts=entrypoints"]}}
     ) == ["console_scripts=entrypoints"]
-    assert PyPi._get_entry_points_from_sdist(
+    assert get_entry_points_from_sdist(
         {"entry_points": {"gui_scripts": ["gui_scripts=entrypoints"]}}
     ) == ["gui_scripts=entrypoints"]
 
     assert sorted(
-        PyPi._get_entry_points_from_sdist(
+        get_entry_points_from_sdist(
             {
                 "entry_points": {
                     "gui_scripts": ["gui_scripts=entrypoints"],
@@ -290,7 +841,7 @@ def test_get_entry_points_from_sdist():
         )
     ) == sorted(["gui_scripts=entrypoints", "console_scripts=entrypoints"])
     assert sorted(
-        PyPi._get_entry_points_from_sdist(
+        get_entry_points_from_sdist(
             {
                 "entry_points": {
                     "gui_scripts": None,
@@ -300,7 +851,7 @@ def test_get_entry_points_from_sdist():
         )
     ) == sorted(["console_scripts=entrypoints"])
     assert sorted(
-        PyPi._get_entry_points_from_sdist(
+        get_entry_points_from_sdist(
             {
                 "entry_points": {
                     "gui_scripts": None,
@@ -310,7 +861,7 @@ def test_get_entry_points_from_sdist():
         )
     ) == sorted(["console_scripts=entrypoints", "foo=bar.main"])
     assert sorted(
-        PyPi._get_entry_points_from_sdist(
+        get_entry_points_from_sdist(
             {
                 "entry_points": {
                     "gui_scripts": "gui_scripts=entrypoints",
@@ -322,13 +873,23 @@ def test_get_entry_points_from_sdist():
 
 
 def test_build_noarch_skip():
-    recipe = PyPi(name="hypothesis", version="5.5.2")
-    assert recipe["build"]["noarch"].values[0] == "python"
-    assert not recipe["build"]["skip"].values
+    recipe = create_python_recipe("hypothesis=5.5.2")[0]
+    assert recipe["build"]["noarch"] == "python"
+    assert "skip" not in recipe["build"]
+
+
+@pytest.mark.github
+def test_build_noarch_skip_github():
+    recipe = create_python_recipe(
+        "https://github.com/HypothesisWorks/hypothesis", version="5.5.2"
+    )[0]
+    assert recipe["build"]["noarch"] == "python"
+    assert "skip" not in recipe["build"]
 
 
 def test_run_requirements_sdist():
-    recipe = PyPi(name="botocore", version="1.14.17")
+    config = Configuration(name="botocore", version="1.14.17")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert sorted(recipe["requirements"]["run"]) == sorted(
         [
             "docutils >=0.10,<0.16",
@@ -339,20 +900,69 @@ def test_run_requirements_sdist():
         ]
     )
 
+    # a more complex example with selectors
+    config = Configuration(name="apache-airflow-providers-trino", version="6.0.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert "noarch" not in recipe["build"]
+    selectors = {
+        "python >=3.9,<4.dev0": None,
+        "apache-airflow-providers-common-sql >=1.20.0": None,
+        "apache-airflow >=2.9.0": None,
+        "pandas >=1.5.3,<2.2": "[py<39]",
+        "pandas >=2.1.2,<2.2": "[py>=39]",
+        "trino-python-client >=0.318.0": None,
+    }
+
+    for dep in recipe["requirements"]["run"]:
+        dep_str = str(dep)
+        assert dep_str in selectors
+        selector = selectors[dep_str]
+        if dep.inline_comment is None:
+            assert selector is None
+        else:
+            assert str(dep.inline_comment) == selector
+
+    # another example with selectors
+    config = Configuration(name="databricks-sql-connector", version="3.7.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert "noarch" not in recipe["build"]
+    selectors = {
+        "python >=3.8.0,<4.0.0": None,
+        "thrift >=0.16.0,<0.21.0": None,
+        "pandas >=1.2.5,<2.3.0": "[py>=38]",
+        "pyarrow >=14.0.1": None,
+        "lz4 >=4.0.2,<5.0.0": None,
+        "requests >=2.18.1,<3.0.0": None,
+        "oauthlib >=3.1.0,<4.0.0": None,
+        "numpy >=1.16.6": "[py>=38 and py<311]",
+        "numpy >=1.23.4": "[py>=311]",
+        "openpyxl >=3.0.10,<4.0.0": None,
+        "urllib3 >=1.26": None,
+    }
+
+    for dep in recipe["requirements"]["run"]:
+        dep_str = str(dep)
+        assert dep_str in selectors
+        selector = selectors[dep_str]
+        if dep.inline_comment is None:
+            assert selector is None
+        else:
+            assert str(dep.inline_comment) == selector
+
 
 def test_format_host_requirements():
-    assert sorted(
-        PyPi._format_dependencies(["setuptools>=40.0", "pkg2"], "pkg1")
-    ) == sorted(["setuptools >=40.0", "pkg2"])
-    assert sorted(
-        PyPi._format_dependencies(["setuptools>=40.0", "pkg2"], "pkg2")
-    ) == sorted(["setuptools >=40.0"])
-    assert sorted(PyPi._format_dependencies(["setuptools >= 40.0"], "pkg")) == sorted(
+    assert sorted(format_dependencies(["setuptools>=40.0", "pkg2"], "pkg1")) == sorted(
+        ["setuptools >=40.0", "pkg2"]
+    )
+    assert sorted(format_dependencies(["setuptools>=40.0", "pkg2"], "pkg2")) == sorted(
+        ["setuptools >=40.0"]
+    )
+    assert sorted(format_dependencies(["setuptools >= 40.0"], "pkg")) == sorted(
         ["setuptools >=40.0"]
     )
     assert sorted(
-        PyPi._format_dependencies(["setuptools_scm [toml] >=3.4.1"], "pkg")
-    ) == sorted(["setuptools_scm >=3.4.1"])
+        format_dependencies(["setuptools_scm [toml] >=3.4.1"], "pkg")
+    ) == sorted(["setuptools_scm  >=3.4.1"])
 
 
 def test_download_pkg_sdist(pkg_pytest):
@@ -362,7 +972,7 @@ def test_download_pkg_sdist(pkg_pytest):
     assert (
         pkg_sha256 == "0d5fe9189a148acc3c3eb2ac8e1ac0742cb7618c084f3d228baaec0c254b318d"
     )
-    setup_cfg = PyPi._get_setup_cfg(os.path.dirname(pkg_pytest))
+    setup_cfg = get_setup_cfg(os.path.dirname(pkg_pytest))
     assert setup_cfg["name"] == "pytest"
     assert setup_cfg["python_requires"] == ">=3.5"
     assert setup_cfg["entry_points"] == {
@@ -371,60 +981,80 @@ def test_download_pkg_sdist(pkg_pytest):
 
 
 def test_ciso_recipe():
-    recipe = PyPi(name="ciso", version="0.1.0")
+    recipe = GrayskullFactory.create_recipe(
+        "pypi", Configuration(name="ciso", version="0.2.2")
+    )
     assert sorted(recipe["requirements"]["host"]) == sorted(
-        ["cython", "numpy", "pip", "python"]
+        [
+            "cython >=3",
+            "numpy >=2.0.0rc1",
+            "oldest-supported-numpy",
+            "pip",
+            "python >=3.9",
+            "setuptools >=41.2",
+            "setuptools-scm",
+            "wheel",
+        ]
     )
     assert sorted(recipe["requirements"]["run"]) == sorted(
-        ["cython", "python", "<{ pin_compatible('numpy') }}"]
+        ["<{ pin_compatible('numpy') }}", "oldest-supported-numpy", "python >=3.9"]
     )
-    assert recipe["test"]["commands"] == "pip check"
-    assert recipe["test"]["requires"] == "pip"
-    assert recipe["test"]["imports"] == "ciso"
+    assert recipe["test"]["commands"] == ["pip check"]
+    assert recipe["test"]["requires"] == ["pip"]
+    assert recipe["test"]["imports"] == ["ciso"]
 
 
 @pytest.mark.serial
-@pytest.mark.xfail(
-    condition=(sys.platform.startswith("win")),
-    reason="Test failing on windows platform",
-)
+@pytest.mark.xfail(reason="Flake test")
 def test_pymc_recipe_fortran():
-    recipe = PyPi(name="pymc", version="2.3.6")
-    assert sorted(recipe["requirements"]["build"]) == sorted(
-        ["<{ compiler('c') }}", "<{ compiler('fortran') }}"]
+    recipe = GrayskullFactory.create_recipe(
+        "pypi", Configuration(name="pymc", version="2.3.6")
     )
-    assert sorted(recipe["requirements"]["host"]) == sorted(["numpy", "python", "pip"])
-    assert sorted(recipe["requirements"]["run"]) == sorted(
-        ["<{ pin_compatible('numpy') }}", "python"]
-    )
+    assert set(recipe["requirements"]["build"]) == {
+        "<{ compiler('c') }}",
+        "<{ compiler('fortran') }}",
+    }
+    assert set(recipe["requirements"]["host"]) == {"numpy", "python", "pip"}
+    assert set(recipe["requirements"]["run"]) == {
+        "<{ pin_compatible('numpy') }}",
+        "python",
+    }
     assert not recipe["build"]["noarch"]
 
 
 def test_pytest_recipe_entry_points():
-    recipe = PyPi(name="pytest", version="5.3.5")
+    recipe = create_python_recipe("pytest=5.3.5", is_strict_cf=False)[0]
     assert sorted(recipe["build"]["entry_points"]) == sorted(
         ["pytest=pytest:main", "py.test=pytest:main"]
     )
     assert recipe["about"]["license"] == "MIT"
     assert recipe["about"]["license_file"] == "LICENSE"
-    assert recipe["build"]["skip"].values[0].value
-    assert recipe["build"]["skip"].values[0].selector == "py2k"
+    assert "skip" in recipe["build"]
+    assert recipe["build"]["skip"].inline_comment == "# [py2k]"
     assert not recipe["build"]["noarch"]
-    assert sorted(recipe["test"]["commands"].values) == sorted(
+    assert sorted(recipe["test"]["commands"]) == sorted(
         ["py.test --help", "pytest --help", "pip check"]
     )
 
 
 def test_cythongsl_recipe_build():
-    recipe = PyPi(name="cythongsl", version="0.2.2")
-    assert recipe["requirements"]["build"] == "<{ compiler('c') }}"
-    assert recipe["requirements"]["host"] == ["cython >=0.16", "pip", "python"]
-    assert not recipe["build"]["noarch"]
+    recipe = GrayskullFactory.create_recipe(
+        "pypi", Configuration(name="cythongsl", version="0.2.2")
+    )
+
+    assert recipe["requirements"]["build"] == ["<{ compiler('c') }}"]
+    assert recipe["requirements"]["host"] == ["python", "cython >=0.16", "pip"]
+    assert recipe["build"]["noarch"] is None
+    assert recipe["build"]["number"] == 0
 
 
-def test_requests_recipe_extra_deps(capsys):
+@pytest.mark.github
+@pytest.mark.parametrize("name", ["requests", "https://github.com/psf/requests"])
+def test_requests_recipe_extra_deps(capsys, name):
     CLIConfig().stdout = True
-    recipe = PyPi(name="requests", version="2.22.0")
+    name = parse_pkg_name_version(name)[1]
+    config = Configuration(name=name, version="2.22.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     captured_stdout = capsys.readouterr()
     assert "win-inet-pton" not in recipe["requirements"]["run"]
     assert recipe["build"]["noarch"]
@@ -433,97 +1063,140 @@ def test_requests_recipe_extra_deps(capsys):
 
 
 def test_zipp_recipe_tags_on_deps():
-    recipe = PyPi(name="zipp", version="3.0.0")
+    config = Configuration(name="zipp", version="3.0.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert recipe["build"]["noarch"]
-    assert recipe["requirements"]["host"] == [
-        "pip",
-        "python >=3.6",
-        "setuptools-scm >=3.4.1",
-    ]
+    assert sorted(recipe["requirements"]["host"]) == sorted(
+        [
+            "python >=3.6",
+            "pip",
+            "setuptools >=42",
+            "setuptools-scm >=3.4.1",
+            "wheel",
+        ]
+    )
 
 
-def test_generic_py_ver_to():
-    assert PyPi._generic_py_ver_to({"requires_python": ">=3.5, <3.8"}) == ">=3.5,<3.8"
+@pytest.mark.parametrize(
+    "requires_python, expected",
+    [(">=3.5, <3.8", ">=3.5,<3.8"), (">=3.7", ">=3.7"), ("~=3.6", ">=3.6")],
+)
+def test_generic_py_ver_to(requires_python, expected):
+    config = Configuration(name="abc")
+    assert generic_py_ver_to({"requires_python": requires_python}, config) == expected
 
 
 def test_botocore_recipe_license_name():
-    recipe = PyPi(name="botocore", version="1.15.8")
+    config = Configuration(name="botocore", version="1.15.8")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert recipe["about"]["license"] == "Apache-2.0"
 
 
 def test_ipytest_recipe_license():
-    recipe = PyPi(name="ipytest", version="0.8.0")
+    config = Configuration(name="ipytest", version="0.8.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert recipe["about"]["license"] == "MIT"
 
 
 def test_get_test_entry_points():
-    assert PyPi._get_test_entry_points("grayskull = grayskull.__main__:main") == [
+    assert get_test_entry_points("grayskull = grayskull.main:main") == [
         "grayskull --help"
     ]
-    assert PyPi._get_test_entry_points(
+    assert get_test_entry_points(
         ["pytest = py.test:main", "py.test = py.test:main"]
     ) == ["pytest --help", "py.test --help"]
 
 
 def test_importlib_metadata_two_setuptools_scm():
-    recipe = PyPi(name="importlib-metadata", version="1.5.0")
+    config = Configuration(name="importlib-metadata", version="1.5.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert "setuptools-scm" in recipe["requirements"]["host"]
     assert "setuptools_scm" not in recipe["requirements"]["host"]
     assert recipe["about"]["license"] == "Apache-2.0"
 
 
 def test_keyring_host_appearing_twice():
-    recipe = PyPi(name="keyring", version="21.1.1")
+    config = Configuration(name="keyring", version="21.1.1")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert "importlib-metadata" in recipe["requirements"]["run"]
     assert "importlib_metadata" not in recipe["requirements"]["run"]
 
 
 def test_python_requires_setup_py():
-    recipe = PyPi(name="pygments", version="2.6.1")
-    assert "noarch" in recipe["build"]
+    config = Configuration(name="pygments", version="2.6.1")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert recipe["build"]["noarch"]
     assert "python >=3.5" in recipe["requirements"]["host"]
     assert "python >=3.5" in recipe["requirements"]["run"]
 
 
-@pytest.mark.skipif(sys.platform.startswith("darwin"), reason="Skipping OSX test")
 def test_django_rest_framework_xml_license():
-    recipe = PyPi(name="djangorestframework-xml", version="1.4.0")
-    assert recipe["about"]["license"] == "BSD-3-Clause"
+    config = Configuration(name="djangorestframework-xml", version="1.4.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert recipe["about"]["license_file"] == "LICENSE"
-    assert recipe["test"]["imports"][0].value == "rest_framework_xml"
+    assert recipe["test"]["imports"][0] == "rest_framework_xml"
+
+
+def test_get_test_requirements():
+    config = Configuration(name="ewokscore", version="0.1.0rc5")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert "pytest" not in recipe["test"]["requires"]
+    assert "pytest --pyargs ewokscore" not in recipe["test"]["commands"]
+
+    config = Configuration(
+        name="ewokscore", version="0.1.0rc5", extras_require_test="wrongoption"
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert "pytest" not in recipe["test"]["requires"]
+    assert "pytest --pyargs ewokscore" not in recipe["test"]["commands"]
+
+    # pytest dependency has no version constraints
+    config = Configuration(
+        name="ewokscore", version="0.1.0rc5", extras_require_test="test"
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert "pytest" in recipe["test"]["requires"]
+    assert "pytest --pyargs ewokscore" in recipe["test"]["commands"]
+
+    # pytest dependency has version constraints
+    config = Configuration(
+        name="ewokscore", version="0.1.0rc8 ", extras_require_test="test"
+    )
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert "pytest" in recipe["test"]["requires"]
+    assert "pytest --pyargs ewokscore" in recipe["test"]["commands"]
 
 
 def test_get_test_imports():
-    assert PyPi._get_test_imports({"packages": ["pkg", "pkg.mod1", "pkg.mod2"]}) == [
-        "pkg",
-        "pkg.mod1",
-    ]
-    assert PyPi._get_test_imports({"packages": None}, default="pkg-mod") == ["pkg_mod"]
-    assert PyPi._get_test_imports({"packages": "pkg"}, default="pkg-mod") == ["pkg"]
+    assert get_test_imports({"packages": ["pkg", "pkg.mod1", "pkg.mod2"]}) == ["pkg"]
+    assert get_test_imports({"packages": None}, default="pkg-mod") == ["pkg_mod"]
+    assert get_test_imports({"packages": "pkg"}, default="pkg-mod") == ["pkg"]
 
 
 def test_nbdime_license_type():
-    recipe = PyPi(name="nbdime", version="2.0.0")
+    config = Configuration(name="nbdime", version="2.0.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert recipe["about"]["license"] == "BSD-3-Clause"
     assert "setupbase" not in recipe["requirements"]["host"]
 
 
 def test_normalize_pkg_name():
-    assert PyPi._normalize_pkg_name("mypy-extensions") == "mypy_extensions"
-    assert PyPi._normalize_pkg_name("mypy_extensions") == "mypy_extensions"
-    assert PyPi._normalize_pkg_name("pytest") == "pytest"
+    assert normalize_pkg_name("mypy-extensions") == "mypy_extensions"
+    assert normalize_pkg_name("mypy_extensions") == "mypy_extensions"
+    assert normalize_pkg_name("pytest") == "pytest"
 
 
 def test_mypy_deps_normalization_and_entry_points():
-    recipe = PyPi(name="mypy", version="0.770")
+    config = Configuration(name="mypy", version="0.770")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
     assert "mypy_extensions >=0.4.3,<0.5.0" in recipe["requirements"]["run"]
     assert "mypy-extensions >=0.4.3,<0.5.0" not in recipe["requirements"]["run"]
     assert "typed-ast >=1.4.0,<1.5.0" in recipe["requirements"]["run"]
     assert "typed_ast <1.5.0,>=1.4.0" not in recipe["requirements"]["run"]
-    assert "typing-extensions >=3.7.4" in recipe["requirements"]["run"]
-    assert "typing_extensions >=3.7.4" not in recipe["requirements"]["run"]
+    assert "typing-extensions >=3.7.4" not in recipe["requirements"]["run"]
+    assert "typing_extensions >=3.7.4" in recipe["requirements"]["run"]
 
-    assert recipe["build"]["entry_points"].values == [
+    assert recipe["build"]["entry_points"] == [
         "mypy=mypy.__main__:console_entry",
         "stubgen=mypy.stubgen:main",
         "stubtest=mypy.stubtest:main",
@@ -535,100 +1208,109 @@ def test_mypy_deps_normalization_and_entry_points():
     condition=sys.platform.startswith("win"), reason="Skipping test for win"
 )
 def test_panel_entry_points(tmpdir):
-    recipe = PyPi(name="panel", version="0.9.1")
-    recipe.generate_recipe(folder_path=str(tmpdir))
+    config = Configuration(name="panel", version="0.9.1")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    generate_recipe(recipe, config, folder_path=str(tmpdir))
     recipe_path = str(tmpdir / "panel" / "meta.yaml")
-    with open(recipe_path, "r") as f:
+    with open(recipe_path) as f:
         content = f.read()
     assert "- panel = panel.cli:main" in content
 
 
 def test_deps_comments():
-    recipe = PyPi(name="kubernetes_asyncio", version="11.2.0")
-    assert recipe["requirements"]["run"] == [
-        "aiohttp >=2.3.10,<4.0.0",
-        "certifi >=14.05.14",
-        "python",
-        "python-dateutil >=2.5.3",
-        "pyyaml >=3.12",
-        "setuptools >=21.0.0",
-        "six >=1.9.0",
-        "urllib3 >=1.24.2",
-    ]
+    config = Configuration(name="kubernetes_asyncio", version="11.2.0")
+    recipe = GrayskullFactory.create_recipe("pypi", config)
+    assert sorted(recipe["requirements"]["run"]) == sorted(
+        [
+            "python",
+            "aiohttp >=2.3.10,<4.0.0",
+            "certifi >=14.05.14",
+            "python-dateutil >=2.5.3",
+            "pyyaml >=3.12",
+            "setuptools >=21.0.0",
+            "six >=1.9.0",
+            "urllib3 >=1.24.2",
+        ]
+    )
 
 
-def test_keep_filename_license():
-    recipe = PyPi(name="respx", version="0.10.1")
+@pytest.mark.github
+@pytest.mark.parametrize("name", ["respx=0.10.1", "https://github.com/lundberg/respx"])
+def test_keep_filename_license(name):
+    recipe = create_python_recipe(name)[0]
     assert recipe["about"]["license_file"] == "LICENSE.md"
 
 
 def test_platform_system_selector():
+    assert parse_extra_metadata_to_selector("platform_system", "==", "Windows") == "win"
     assert (
-        PyPi._parse_extra_metadata_to_selector("platform_system", "==", "Windows")
-        == "win"
-    )
-    assert (
-        PyPi._parse_extra_metadata_to_selector("platform_system", "!=", "Windows")
+        parse_extra_metadata_to_selector("platform_system", "!=", "Windows")
         == "not win"
     )
 
 
 def test_tzdata_without_setup_py():
-    recipe = PyPi(name="tzdata", version="2020.1")
+    recipe = create_python_recipe("tzdata=2020.1")[0]
     assert recipe["build"]["noarch"] == "python"
     assert recipe["about"]["home"] == "https://github.com/python/tzdata"
 
 
 def test_multiples_exit_setup():
     """Bug fix #146"""
-    recipe = PyPi(name="pyproj", version="2.6.1")
-    assert recipe
+    assert create_python_recipe("pyproj=2.6.1")[0]
 
 
-def test_sequence_inside_another_in_dependencies():
-    recipe = PyPi(name="unittest2", version="1.1.0")
-    assert recipe["requirements"]["host"] == [
-        "argparse",
-        "pip",
-        "python",
-        "six >=1.4",
-        "traceback2",
-    ]
-    assert recipe["requirements"]["run"] == [
-        "argparse",
-        "python",
-        "six >=1.4",
-        "traceback2",
-    ]
+def test_sequence_inside_another_in_dependencies(freeze_py_cf_supported):
+    recipe = create_python_recipe(
+        "unittest2=1.1.0",
+        is_strict_cf=True,
+        py_cf_supported=freeze_py_cf_supported,
+    )[0]
+    assert sorted(recipe["requirements"]["host"]) == sorted(
+        [
+            "python >=3.6",
+            "argparse",
+            "pip",
+            "six >=1.4",
+            "traceback2",
+        ]
+    )
+    assert sorted(recipe["requirements"]["run"]) == sorted(
+        [
+            "python >=3.6",
+            "argparse",
+            "six >=1.4",
+            "traceback2",
+        ]
+    )
 
 
 def test_recipe_with_just_py_modules():
-    recipe = PyPi(name="python-markdown-math", version="0.7")
-    assert recipe["test"]["imports"] == "mdx_math"
+    recipe = create_python_recipe("python-markdown-math=0.7")[0]
+    assert recipe["test"]["imports"] == ["mdx_math"]
 
 
 def test_recipe_extension():
-    recipe = PyPi(name="azure-identity", version="1.3.1")
+    recipe = create_python_recipe("azure-identity=1.3.1")[0]
     assert (
-        recipe["source"]["url"][0].value
-        == "https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/"
+        recipe["source"]["url"]
+        == "https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/"
         "azure-identity-{{ version }}.zip"
     )
 
 
 def test_get_url_filename():
-    assert PyPi._get_url_filename({}) == "{{ name }}-{{ version }}.tar.gz"
-    assert PyPi._get_url_filename({}, "default") == "default"
+    assert get_url_filename({}) == "{{ name }}-{{ version }}.tar.gz"
+    assert get_url_filename({}, "default") == "default"
     assert (
-        PyPi._get_url_filename({"urls": [{"packagetype": "nothing"}]})
+        get_url_filename({"urls": [{"packagetype": "nothing"}]})
         == "{{ name }}-{{ version }}.tar.gz"
     )
     assert (
-        PyPi._get_url_filename({"urls": [{"packagetype": "nothing"}]}, "default")
-        == "default"
+        get_url_filename({"urls": [{"packagetype": "nothing"}]}, "default") == "default"
     )
     assert (
-        PyPi._get_url_filename(
+        get_url_filename(
             {
                 "info": {"version": "1.2.3"},
                 "urls": [{"packagetype": "sdist", "filename": "foo_file-1.2.3.zip"}],
@@ -639,14 +1321,283 @@ def test_get_url_filename():
 
 
 def test_clean_deps_for_conda_forge():
-    assert clean_deps_for_conda_forge(["deps1", "deps2  # [py34]"]) == ["deps1"]
-    assert clean_deps_for_conda_forge(["deps1", "deps2  # [py<34]"]) == ["deps1"]
-    assert clean_deps_for_conda_forge(["deps1", "deps2  # [py<38]"]) == [
+    assert clean_deps_for_conda_forge(["deps1", "deps2  # [py34]"], PyVer(3, 6)) == [
+        "deps1"
+    ]
+    assert clean_deps_for_conda_forge(["deps1", "deps2  # [py<34]"], PyVer(3, 6)) == [
+        "deps1"
+    ]
+    assert clean_deps_for_conda_forge(["deps1", "deps2  # [py<38]"], PyVer(3, 6)) == [
         "deps1",
         "deps2  # [py<38]",
     ]
 
 
 def test_empty_entry_points():
-    recipe = PyPi(name="modulegraph", version="0.18")
-    assert recipe["build"]["entry_points"] == "modulegraph = modulegraph.__main__:main"
+    recipe = create_python_recipe("modulegraph=0.18")[0]
+    assert recipe["build"]["entry_points"] == [
+        "modulegraph = modulegraph.__main__:main"
+    ]
+
+
+def test_noarch_metadata():
+    recipe = create_python_recipe("policy_sentry=0.11.16")[0]
+    assert recipe["build"]["noarch"] == "python"
+
+
+def test_arch_metadata():
+    recipe = create_python_recipe("remove_dagmc_tags=0.0.5")[0]
+    assert "noarch" not in recipe["build"]
+
+
+def test_entry_points_is_list_of_str():
+    """Test to verify that whether console_scripts is a list of strings,
+    a multiline string, or a list of empty lists; entry_points is always a list"""
+    sdist_metadata = {
+        "entry_points": {
+            "console_scripts": [
+                "ptpython = ptpython.entry_points.run_ptpython:run",
+                "ptipython = ptpython.entry_points.run_ptipython:run",
+                "ptpython3 = ptpython.entry_points.run_ptpython:run",
+                "ptpython3.9 = ptpython.entry_points.run_ptpython:run",
+                "ptipython3 = ptpython.entry_points.run_ptipython:run",
+                "ptipython3.9 = ptpython.entry_points.run_ptipython:run",
+            ]
+        },
+    }
+    assert isinstance(get_entry_points_from_sdist(sdist_metadata), list)
+    sdist_metadata = {
+        "entry_points": {
+            "console_scripts": """
+                ptpython = ptpython.entry_points.run_ptpython:run
+                ptipython = ptpython.entry_points.run_ptipython:run
+                ptpython3 = ptpython.entry_points.run_ptpython:run
+                ptpython3.9 = ptpython.entry_points.run_ptpython:run
+                ptipython3 = ptpython.entry_points.run_ptipython:run
+                ptipython3.9 = ptpython.entry_points.run_ptipython:run
+                """
+        },
+    }
+    assert isinstance(get_entry_points_from_sdist(sdist_metadata), list)
+    sdist_metadata = {
+        "entry_points": {"console_scripts": [[]]},
+    }
+    assert isinstance(get_entry_points_from_sdist(sdist_metadata), list)
+
+
+def test_replace_slash_in_imports():
+    recipe = create_python_recipe("asgi-lifespan=1.0.1")[0]
+    assert ["asgi_lifespan"] == recipe["test"]["imports"]
+
+
+def test_add_python_min_to_strict_conda_forge(freeze_py_cf_supported):
+    recipe = create_python_recipe(
+        "dgllife=0.2.8",
+        is_strict_cf=True,
+        py_cf_supported=freeze_py_cf_supported,
+    )[0]
+    assert recipe["build"]["noarch"] == "python"
+    assert recipe["requirements"]["host"][0] == "python >=3.6"
+    assert "python >=3.6" in recipe["requirements"]["run"]
+
+
+def test_get_test_imports_clean_modules():
+    assert get_test_imports(
+        {
+            "packages": [
+                "_pytest",
+                "tests",
+                "test",
+                "_pytest._code",
+                "_pytest._io",
+                "_pytest.assertion",
+                "_pytest.config",
+                "_pytest.mark",
+                "pytest",
+                "pytest.foo",
+                "zar",
+            ]
+        }
+    ) == ["pytest", "zar"]
+    assert get_test_imports(
+        {
+            "packages": [
+                "_pytest",
+                "_pytest._code",
+                "_pytest._io",
+                "_pytest.assertion",
+                "_pytest.config",
+                "_pytest.mark",
+            ]
+        }
+    ) == ["_pytest", "_pytest._code"]
+
+
+def test_create_recipe_from_local_sdist(pkg_pytest):
+    recipe = create_python_recipe(pkg_pytest, from_local_sdist=True)[0]
+    assert recipe["source"]["url"] == f"file://{pkg_pytest}"
+    assert recipe["about"]["home"] == "https://docs.pytest.org/en/latest/"
+    assert recipe["about"]["summary"] == "pytest: simple powerful testing with Python"
+    assert recipe["about"]["license"] == "MIT"
+    assert recipe["about"]["license_file"] == "LICENSE"
+    assert get_global_jinja_var(recipe, "name") == "pytest"
+    assert get_global_jinja_var(recipe, "version") == "5.3.5"
+
+
+@patch("grayskull.strategy.py_base.get_all_toml_info", return_value={})
+def test_400_for_python_selector(monkeypatch):
+    recipe = create_python_recipe("pyquil", version="3.0.1")[0]
+    assert recipe["build"]["skip"].selector == "py>=400 or py2k"
+
+
+def test_notice_file():
+    recipe, _ = create_python_recipe(
+        "apache-airflow-providers-databricks", version="3.1.0"
+    )
+    assert set(recipe["about"]["license_file"]) == {"NOTICE", "LICENSE"}
+    assert recipe["about"]["license"] == "Apache-2.0"
+
+
+def test_notice_file_different_licence():
+    with patch(
+        "grayskull.license.discovery.get_license_type",
+        side_effect=["Apache-2.0", "MIT"],
+    ):
+        recipe, _ = create_python_recipe(
+            "apache-airflow-providers-databricks", version="3.1.0"
+        )
+    assert set(recipe["about"]["license_file"]) == {"NOTICE", "LICENSE"}
+    assert recipe["about"]["license"] in ["MIT AND Apache-2.0", "Apache-2.0 AND MIT"]
+
+
+# Need to find another package for this test
+@pytest.mark.skipif(
+    sys.version_info >= (3, 12),
+    reason="consolemd setup.py requires lower than python 3.12",
+)
+def test_console_script_toml_format():
+    recipe, _ = create_python_recipe("consolemd", version="0.5.1")
+    assert recipe["build"]["entry_points"] == ["consolemd = consolemd.cli:cli"]
+
+
+def test_section_order():
+    recipe, _ = create_python_recipe("requests", version="2.27.1")
+    assert (
+        "package",
+        "source",
+        "build",
+        "requirements",
+        "test",
+        "outputs",
+        "about",
+        "extra",
+    ) == tuple(recipe.keys())
+
+
+def test_no_sdist_pkg_pypi():
+    with pytest.raises(
+        AttributeError, match="There is no sdist package on pypi for arn"
+    ):
+        recipe, _ = create_python_recipe("arn", version="0.1.5")
+
+
+def test_remove_selectors_pkgs_if_needed():
+    assert remove_selectors_pkgs_if_needed(
+        [
+            "import_metadata >1.0  # [py>3]",
+            "pywin32  # [win]",
+            "requests >=2.0  # [unix]",
+        ]
+    ) == ["import_metadata >1.0", "pywin32", "requests >=2.0  # [unix]"]
+
+
+def test_remove_selectors_pkgs_if_needed_with_recipe():
+    recipe, _ = create_python_recipe("transformers", is_strict_cf=True, version="4.3.3")
+    assert set(recipe["requirements"]["run"]).issubset(
+        {
+            "dataclasses",
+            "filelock",
+            "importlib-metadata",
+            "numpy >=1.17",
+            "packaging",
+            "python",
+            "regex !=2019.12.17",
+            "requests",
+            "sacremoses",
+            "tokenizers <0.11,>=0.10.1",
+            "tokenizers >=0.10.1,<0.11",
+            "tqdm >=4.27",
+        }
+    )
+
+
+def test_noarch_python_min_constrain(freeze_py_cf_supported):
+    recipe, _ = create_python_recipe(
+        "humre",
+        is_strict_cf=True,
+        version="0.1.1",
+        py_cf_supported=freeze_py_cf_supported,
+    )
+    assert recipe["requirements"]["run"] == ["python >=3.6"]
+
+
+def test_cpp_language_extra():
+    recipe, _ = create_python_recipe("xbcausalforest", version="0.1.3")
+    assert set(recipe["requirements"]["build"]) == {
+        "<{ compiler('cxx') }}",
+        "<{ compiler('c') }}",
+    }
+
+
+def test_sort_reqs():
+    # There are currently two acceptable sortings. Original ordering or alphabetical.
+    # In either sorting, 'python' always comes first.
+    original_deps = ["pandas >=1.0", "numpy", "python", "scipy"]
+    original_deps_38 = ["pandas >=1.0", "numpy", "python >=3.8", "scipy"]
+    sorted_deps_orig = ["python", "pandas >=1.0", "numpy", "scipy"]
+    sorted_deps_alpha = ["python", "numpy", "pandas >=1.0", "scipy"]
+    sorted_deps_orig_38 = ["python >=3.8", "pandas >=1.0", "numpy", "scipy"]
+    sorted_deps_alpha_38 = ["python >=3.8", "numpy", "pandas >=1.0", "scipy"]
+
+    assert sort_reqs(original_deps) in [sorted_deps_orig, sorted_deps_alpha]
+    assert sort_reqs(original_deps_38) in [sorted_deps_orig_38, sorted_deps_alpha_38]
+
+
+@patch("grayskull.strategy.pypi.get_metadata")
+def test_metadata_pypi_none_value(mock_get_data):
+    mock_get_data.return_value = {
+        "package": {"name": "pypylon", "version": "1.2.3"},
+        "build": {"test": [None]},
+    }
+    recipe = Recipe(name="pypylon")
+    update_recipe(
+        recipe,
+        Configuration(name="pypylon", repo_github="https://github.com/basler/pypylon"),
+        ("package", "build"),
+    )
+    assert recipe["build"]["test"] == []
+
+
+@pytest.mark.parametrize(
+    "param, result",
+    [
+        ({"test": [None, None, None]}, {"test": []}),
+        ({"test": [None, "foo", None]}, {"test": ["foo"]}),
+        ({"test": [None, "foo", None, "bar", None]}, {"test": ["foo", "bar"]}),
+        ({"test": [None, "foo", None, "bar", None, None]}, {"test": ["foo", "bar"]}),
+    ],
+)
+def test_remove_all_inner_none(param, result):
+    assert remove_all_inner_nones(param) == result
+
+
+def test_check_noarch_python_for_new_deps():
+    config = Configuration(
+        is_strict_cf=True, name="abcd", version="0.1.0", is_arch=True
+    )
+    check_noarch_python_for_new_deps(
+        ["python >=3.6", "pip"],
+        ["dataclasses >=3.6", "python >=3.6"],
+        config,
+    )
+    assert config.is_arch is False

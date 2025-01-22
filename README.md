@@ -1,28 +1,28 @@
 # Grayskull
 -------------
-![Tests](https://github.com/conda-incubator/grayskull/workflows/Tests/badge.svg?branch=master) ![Checkers](https://github.com/conda-incubator/grayskull/workflows/Checkers/badge.svg?branch=master) ![Deployment (PyPI)](https://github.com/conda-incubator/grayskull/workflows/Upload%20Package%20to%20PyPI/badge.svg)
+[![Tests](https://github.com/conda/grayskull/actions/workflows/tests.yml/badge.svg)](https://github.com/conda/grayskull/actions/workflows/tests.yml) [![Deployment (PyPI)](https://github.com/conda/grayskull/actions/workflows/publish_pypi.yml/badge.svg)](https://github.com/conda/grayskull/actions/workflows/publish_pypi.yml)
 
-[![codecov](https://codecov.io/gh/conda-incubator/grayskull/branch/master/graph/badge.svg)](https://codecov.io/gh/conda-incubator/grayskull) [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black) ![](https://img.shields.io/badge/python-3.7+-blue.svg) ![](https://img.shields.io/github/license/conda-incubator/grayskull.svg) [![PyPI version](https://badge.fury.io/py/grayskull.svg)](https://badge.fury.io/py/grayskull) [![Conda Version](https://img.shields.io/conda/vn/conda-forge/grayskull.svg)](https://anaconda.org/conda-forge/grayskull) [![Gitter](https://badges.gitter.im/conda_grayskull/community.svg)](https://gitter.im/conda_grayskull/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge) [![Language grade: Python](https://img.shields.io/lgtm/grade/python/g/conda-incubator/grayskull.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/conda-incubator/grayskull/context:python)
+[![codecov](https://codecov.io/gh/conda/grayskull/branch/master/graph/badge.svg)](https://codecov.io/gh/conda/grayskull) [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black) ![](https://img.shields.io/badge/python-3.8+-blue.svg) ![](https://img.shields.io/github/license/conda/grayskull.svg) [![PyPI version](https://badge.fury.io/py/grayskull.svg)](https://badge.fury.io/py/grayskull) [![Conda Version](https://img.shields.io/conda/vn/conda-forge/grayskull.svg)](https://anaconda.org/conda-forge/grayskull) [![Gitter](https://badges.gitter.im/conda_grayskull/community.svg)](https://gitter.im/conda_grayskull/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge)
 
 -------------
 <span align="center">
     <br>
-    <img src="https://comicvine1.cbsistatic.com/uploads/original/4/49448/2661756-castle_grayskull.jpg" align="center" />
+    <img src="https://static.wikia.nocookie.net/heman/images/3/33/Grayskull.jpg" align="center" />
     <br>
-    <i>"Skeleto<strike>n</strike>r's main goal is to conquer the mysterious fortress of Castle Grayskull, from which He-Man draws his powers. If he succeeds, Skeletor would be able to conquer not only Eternia, but the whole universe."</i> </br>Adapted from <a href=https://en.wikipedia.org/wiki/Skeletor>Wikipedia</a>
+    <i>"Skeleto<strike>n</strike>r's main goal is to conquer the mysterious fortress of Castle Grayskull, from which He-Man draws his powers. If he succeeds, Skeletor would be able to conquer not only Eternia, but the whole universe."</i> </br>Adapted from <a href=https://en.wikipedia.org/wiki/Skeletor>Wikipedia</a>. Image credits: <a href=https://he-man.fandom.com>https://he-man.fandom.com</a>
 </span>
 
 
 -------------
 ## Introduction
 
-The Grayskull project was created with the intention to eventually replace the
-`conda skeleton`. The main goal of this project is to generate concise recipes
- for [conda-forge](https://conda-forge.org/).
-
-The current status of ``grayskull`` is generating recipes just looking for ``PyPI``,
- but in the future we will expand that to also support to load recipes and also
- generate recipes looking for other repositories, such as, CRAN, Conan, etc..
+Grayskull is an automatic conda recipe generator. <br>
+The main goal of this project is to generate concise recipes
+for [conda-forge](https://conda-forge.org/).
+The Grayskull project was created with the intention to eventually replace `conda skeleton`. <br>
+Presently Grayskull can generate recipes for Python packages available on PyPI and also those not published on PyPI but available as GitHub repositories.
+Grayskull can also generate recipes for R packages published on CRAN.
+Future versions of Grayskull will support recipe generation for packages of other repositories such as Conan and CPAN etc..
 
 ## Installation
 
@@ -38,7 +38,7 @@ conda install -c conda-forge grayskull
 
 It is also possible to clone this repo and install it using `pip`:
 ```bash
-git clone https://github.com/conda-incubator/grayskull.git
+git clone https://github.com/conda/grayskull.git
 cd grayskull
 pip install -e .
 ```
@@ -46,7 +46,7 @@ pip install -e .
 ## Usage
 
 It is pretty simple to use `grayskull`. Just call it, pass the repository
- (just `pypi` for now) and the package name.
+ (`pypi` or `cran`) and the package name.
 
 * Example:
 ```bash
@@ -54,12 +54,48 @@ grayskull pypi pytest
 ```
 
 After that `grayskull` will create a folder with the same name as the package
-and inside of this folder it will generated the recipe (`meta.yaml`).
+and inside this folder the generated recipe will be present (`meta.yaml`).
 
 * Example with `pytest` (`grayskull pypi pytest`):
 
-![Grayskull CLI](https://raw.githubusercontent.com/conda-incubator/grayskull/master/docs/images/cli_example_grayskull.gif)
+![Grayskull CLI](https://github.com/conda/grayskull/raw/main/images/cli_example_grayskull.gif)
 
+If your package is a GitHub repository just replace the package name with the GitHub repository URL. <br>
+For example: <br>
+
+```bash
+grayskull pypi https://github.com/confluentinc/confluent-kafka-python
+```
+
+You can also generate a recipe from a local sdist archive:
+
+```bash
+grayskull pypi ./pytest-5.3.5.tar.gz
+```
+
+Note that such a recipe isn't really portable as it will depend on the local path of the
+sdist file. It can be useful if you want to automatically generate a conda package.
+
+### Use Grayskull with an internal package index
+
+Grayskull can create recipes that point to any Python Package Index. Supply the `--pypi-mirror-url` keyword.
+
+* Example:
+```bash
+grayskull pypi --pypi-mirror-url https://pypi.example.com pytest
+```
+
+The above will source packages from `https://pypi.example.com/packages/source/...`
+
+This assumes that the mirror follows the same API as pypi _including_ hosting metadata at the `/pypi/{package_name}/json` endpoint.
+To specify an alternate metadata location use the `--pypi-metadata-url` option.
+
+* Example:
+```bash
+grayskull pypi --pypi-mirror-url https://pypi.example.com --pypi-metadata-url https://pypi_meta.example.com pytest
+```
+
+> *Note:* `--pypi-metadata-url` is a replacement for `--pypi-url`; `--pypi-url` is deprecated and will be removed in a future release.
 
 ### Online Grayskull
 
@@ -67,6 +103,6 @@ It is also possible to use Grayskull without any installation. You can go to thi
 
 
 ## License
-Copyright Marcelo Duarte Trevisani and contributors, 2020-2021.
+Copyright Marcelo Duarte Trevisani and contributors, 2020-2023.
 
 Distributed under the terms of the Apache 2.0 license, grayskull is free and open source software.

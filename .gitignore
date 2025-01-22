@@ -69,7 +69,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
-docs/_build/
+docs/build/
 
 # PyBuilder
 target/
@@ -133,3 +133,7 @@ dmypy.json
 
 # Project version
 grayskull/_version.py
+
+# pixi environments
+.pixi
+*.egg-info

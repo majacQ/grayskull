@@ -1,18 +1,23 @@
+from __future__ import annotations
+
 import base64
+import json
 import logging
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 from operator import itemgetter
 from pathlib import Path
 from subprocess import check_output
 from tempfile import mkdtemp
-from typing import List, Optional, Union
 
 import requests
+from colorama import Fore
 from rapidfuzz import process
-from rapidfuzz.fuzz import token_set_ratio, token_sort_ratio
+from rapidfuzz.distance import OSA
+from rapidfuzz.fuzz import partial_ratio, token_set_ratio, token_sort_ratio
 
 from grayskull.cli.stdout import print_msg
 from grayskull.license.data import get_all_licenses  # noqa
@@ -23,17 +28,25 @@ log = logging.getLogger(__name__)
 @dataclass
 class ShortLicense:
     name: str
-    path: Union[str, Path, None]
+    path: str | Path | None
     is_packaged: bool
 
 
 @lru_cache(maxsize=10)
-def get_all_licenses_from_spdx() -> List:
+def get_all_licenses_from_spdx() -> list:
     """Get all licenses available on spdx.org
 
     :return: List with all licenses information on spdx.org
     """
-    response = requests.get(url="https://spdx.org/licenses/licenses.json", timeout=5)
+    try:
+        response = requests.get(
+            url="https://spdx.org/licenses/licenses.json", timeout=5
+        )
+    except requests.exceptions.ConnectionError:
+        log.info(
+            "SPDX licence server didn't respond. Grayskull will continue without that."
+        )
+        return []
     log.debug(
         f"Response from spdx.org. Status code:{response.status_code},"
         f" response: {response}"
@@ -50,6 +63,19 @@ def get_all_licenses_from_spdx() -> List:
     ]
 
 
+def _match_scrambled_exact(candidate, licenses) -> str | None:
+    """
+    Return license with rearranged word order only.
+
+    Fancy scorer confuses BSD-3-Clause with DEC-3-Clause.
+    """
+    bag = set(re.findall(r"\w+", candidate.lower()))
+    for license in licenses:
+        if bag == set(re.findall(r"\w+", license.lower())):
+            return license
+    return None
+
+
 def match_license(name: str) -> dict:
     """Match if the given license name matches any license present on
     spdx.org
@@ -58,28 +84,72 @@ def match_license(name: str) -> dict:
     :return: Information of the license matched
     """
     all_licenses = get_all_licenses_from_spdx()
+    if not all_licenses:
+        return {}
     name = re.sub(r"\s+license\s*", "", name.strip(), flags=re.IGNORECASE)
+    name = name.strip()
 
-    best_matches = process.extract(name, _get_all_license_choice(all_licenses))
-    spdx_license = best_matches[0]
-    if spdx_license[1] != 100:
-        best_matches = [lic[0] for lic in best_matches if not lic[0].endswith("-only")]
+    exact_match = _match_scrambled_exact(name, _get_all_license_choice(all_licenses))
+    if exact_match:
+        best_matches = [(exact_match, 100, 0)]
+        spdx_license = best_matches[0]
+    else:
+        best_matches = process.extract(
+            name, _get_all_license_choice(all_licenses), scorer=partial_ratio
+        )
+        best_matches = process.extract(name, [lc for lc, *_ in best_matches])
+        spdx_license = best_matches[0]
+
+    if spdx_license[1] < 100:
+        # Prefer "-or-later" licenses over the "-only"
+        later_licenses = {
+            lic[0].replace("-or-later", "")
+            for lic in best_matches
+            if lic[0].endswith("-or-later")
+        }
+        best_matches = [
+            lic[0]
+            for lic in best_matches
+            if not (
+                lic[0].endswith("-only")
+                and lic[0].replace("-only", "") in later_licenses
+            )
+        ]
 
         if best_matches:
-            best_matches = process.extract(name, best_matches, scorer=token_set_ratio)
+            best_matches = process.extract(
+                name, best_matches, scorer=OSA.normalized_similarity
+            )
+            original_matches = deepcopy(best_matches)
+
+            if name.startswith("GPL"):
+                original_matches = [
+                    m for m in original_matches if m[0].startswith("GPL")
+                ]
             spdx_license = best_matches[0]
-            best_matches = [lic[0] for lic in best_matches if lic[1] >= spdx_license[1]]
+            best_matches = [
+                lic[0] for lic in original_matches if lic[1] >= spdx_license[1]
+            ]
             if len(best_matches) > 1:
                 spdx_license = process.extractOne(
                     name, best_matches, scorer=token_sort_ratio
                 )
+            if original_matches and original_matches[0][1] < 0.55:
+                spdx_license = process.extractOne(
+                    name, [m[0] for m in original_matches], scorer=token_sort_ratio
+                )
+
+    if spdx_license[1] != 100 and spdx_license[0].startswith("MIT"):
+        spdx_license = "MIT"
+    else:
+        spdx_license = spdx_license[0]
 
     log.info(
         f"Best match for license {name} was {spdx_license}.\n"
         f"Best matches: {best_matches}"
     )
 
-    return _get_license(spdx_license[0], all_licenses)
+    return _get_license(spdx_license, all_licenses)
 
 
 def get_short_license_id(name: str) -> str:
@@ -89,10 +159,12 @@ def get_short_license_id(name: str) -> str:
     :return: short identifier (spdx) for the given license name
     """
     recipe_license = match_license(name)
+    if not recipe_license:
+        return "IT-WAS-NOT-POSSIBLE-TO-RECOVER-LICENCE"
     return recipe_license["licenseId"]
 
 
-def _get_license(license_id: str, all_licenses: List) -> dict:
+def _get_license(license_id: str, all_licenses: list) -> dict:
     """Search for the license identification in all licenses received
 
     :param license_id: license identification
@@ -104,7 +176,7 @@ def _get_license(license_id: str, all_licenses: List) -> dict:
             return one_license
 
 
-def _get_all_names_from_api(one_license: dict) -> List:
+def _get_all_names_from_api(one_license: dict) -> list:
     """Get the names and other names which each license has.
 
     :param one_license: License name
@@ -120,7 +192,7 @@ def _get_all_names_from_api(one_license: dict) -> List:
     return list(result)
 
 
-def get_other_names_from_opensource(license_spdx: str) -> List:
+def get_other_names_from_opensource(license_spdx: str) -> list:
     lic = get_opensource_license(license_spdx)
     return [_license["name"] for _license in lic.get("other_names", [])]
 
@@ -136,15 +208,23 @@ def get_opensource_license(license_spdx: str) -> dict:
     return {}
 
 
+def read_licence_cache():
+    with open(Path(__file__).parent / "licence_cache.json") as licence_cache:
+        return json.load(licence_cache)
+
+
 @lru_cache(maxsize=10)
-def get_opensource_license_data() -> List:
-    response = requests.get(url="https://api.opensource.org/licenses/", timeout=5)
+def get_opensource_license_data() -> list:
+    try:
+        response = requests.get(url="https://api.opensource.org/licenses/", timeout=5)
+    except requests.exceptions.RequestException:
+        return read_licence_cache()
     if response.status_code != 200:
-        return []
+        return read_licence_cache()
     return response.json()
 
 
-def _get_all_license_choice(all_licenses: List) -> List:
+def _get_all_license_choice(all_licenses: list) -> list:
     """Function responsible to get the whole licenses name
 
     :param all_licenses: list with all licenses
@@ -158,10 +238,11 @@ def _get_all_license_choice(all_licenses: List) -> List:
 
 def search_license_file(
     folder_path: str,
-    git_url: Optional[str] = None,
-    version: Optional[str] = None,
-    license_name_metadata: Optional[str] = None,
-) -> Optional[ShortLicense]:
+    git_url: str | None = None,
+    version: str | None = None,
+    license_name_metadata: str | None = None,
+    folders_exclude_search: tuple[str, ...] = tuple(),
+) -> list[ShortLicense]:
     """Search for the license file. First it will try to find it in the given
     folder, after that it will search on the github api and for the last it will
     clone the repository and it will search for the license there.
@@ -175,8 +256,10 @@ def search_license_file(
     if license_name_metadata:
         license_name_metadata = get_short_license_id(license_name_metadata)
 
-    license_sdist = search_license_folder(folder_path, license_name_metadata)
-    if license_sdist:
+    all_license_sdist = search_license_folder(
+        folder_path, license_name_metadata, folders_exclude_search
+    )
+    for license_sdist in all_license_sdist:
         license_sdist.is_packaged = True
         license_sdist.path = os.path.relpath(license_sdist.path, folder_path)
         license_sdist.path = license_sdist.path.replace("\\", "/")
@@ -184,25 +267,28 @@ def search_license_file(
         splited = license_sdist.path.split("/")
         if len(splited) > 1:
             license_sdist.path = "/".join(splited[1:])
-        return license_sdist
+    if all_license_sdist:
+        return all_license_sdist
 
     if not git_url:
-        return ShortLicense(license_name_metadata, None, False)
+        return [ShortLicense(license_name_metadata, None, False)]
 
     github_license = search_license_api_github(git_url, version, license_name_metadata)
     if github_license:
-        return github_license
+        return [github_license]
 
-    repo_license = search_license_repo(git_url, version, license_name_metadata)
+    repo_license = search_license_repo(
+        git_url, version, license_name_metadata, folders_exclude_search
+    )
     if repo_license:
         return repo_license
-    return ShortLicense(license_name_metadata, None, False)
+    return [ShortLicense(license_name_metadata, None, False)]
 
 
 @lru_cache(maxsize=13)
 def search_license_api_github(
-    github_url: str, version: Optional[str] = None, default: Optional[str] = "Other"
-) -> Optional[ShortLicense]:
+    github_url: str, version: str | None = None, default: str | None = "Other"
+) -> ShortLicense | None:
     """Search for the license asking in the github api
 
     :param github_url: GitHub URL
@@ -230,7 +316,7 @@ def search_license_api_github(
     )
 
 
-def _get_api_github_url(github_url: str, version: Optional[str] = None) -> str:
+def _get_api_github_url(github_url: str, version: str | None = None) -> str:
     """Try to presume the github url
 
     :param github_url: GitHub URL
@@ -246,35 +332,51 @@ def _get_api_github_url(github_url: str, version: Optional[str] = None) -> str:
 
 
 def search_license_folder(
-    path: Union[str, Path], default: Optional[str] = None
-) -> Optional[ShortLicense]:
+    path: str | Path,
+    default: str | None = None,
+    folders_exclude_search: tuple[str, ...] = tuple(),
+) -> list[ShortLicense]:
     """Search for the license in the given folder
 
     :param path: Sdist folder
     :param default: Default value for the license type
     :return: License information
     """
-    re_search = re.compile(
-        r"(\bcopyright\b|\blicense[s]*\b|\bcopying\b|\bcopyleft\b)", re.IGNORECASE
+    folders_exclude_search = set(
+        list(folders_exclude_search) + ["doc", "theme", "themes", "docs"]
     )
-    for folder_path, _, filenames in os.walk(str(path)):
-        if os.path.basename(folder_path).startswith("."):
-            continue
+    re_search = re.compile(
+        r"(\bcopyright\b|\bnotice\b|\blicense[s]*\b|\bcopying\b|\bcopyleft\b)",
+        re.IGNORECASE,
+    )
+    all_licences = []
+    for folder_path, dirnames, filenames in os.walk(str(path)):
+        dirnames[:] = [
+            folder
+            for folder in dirnames
+            if folder not in folders_exclude_search and not folder.startswith(".")
+        ]
         for one_file in filenames:
             if re_search.match(one_file):
                 lc_path = os.path.join(folder_path, one_file)
-                return ShortLicense(get_license_type(lc_path, default), lc_path, False)
-    return None
+                all_licences.append(
+                    ShortLicense(get_license_type(lc_path, default), lc_path, False)
+                )
+    return all_licences
 
 
 def search_license_repo(
-    git_url: str, version: Optional[str], default: Optional[str] = None
-) -> Optional[ShortLicense]:
+    git_url: str,
+    version: str | None,
+    default: str | None = None,
+    folders_exclude_search: tuple[str, ...] = tuple(),
+) -> list[ShortLicense] | None:
     """Search for the license file in the given github repository
 
     :param git_url: GitHub URL
     :param version: Package version
     :param default: Default value for the license type
+    :param folders_exclude_search: Folders names to be excluded from search for licences
     :return: License information
     """
     git_url = re.sub(r"/$", ".git", git_url)
@@ -289,12 +391,16 @@ def search_license_repo(
             f" url: {git_url}, version: {version}. Exception: {err}"
         )
         if not version.startswith("v"):
-            return search_license_repo(git_url, f"v{version}", default)
+            return search_license_repo(
+                git_url, f"v{version}", default, folders_exclude_search
+            )
         return None
-    return search_license_folder(str(tmp_dir), default)
+    return search_license_folder(
+        str(tmp_dir), default, folders_exclude_search=folders_exclude_search
+    )
 
 
-def _get_git_cmd(git_url: str, version: str, dest) -> List[str]:
+def _get_git_cmd(git_url: str, version: str, dest) -> list[str]:
     """Return the full git command to clone the repository
 
     :param git_url: GitHub URL
@@ -308,7 +414,7 @@ def _get_git_cmd(git_url: str, version: str, dest) -> List[str]:
     return git_cmd + [git_url, str(dest)]
 
 
-def get_license_type(path_license: str, default: Optional[str] = None) -> Optional[str]:
+def get_license_type(path_license: str, default: str | None = None) -> str | None:
     """Function tries to match the license with one of the models present in
     grayskull/license/data
 
@@ -316,7 +422,7 @@ def get_license_type(path_license: str, default: Optional[str] = None) -> Option
     :param default: Default value for the license type
     :return: License type
     """
-    with open(path_license, "r") as license_file:
+    with open(path_license, errors="ignore") as license_file:
         license_content = license_file.read()
     find_apache = re.findall(
         r"apache\.org\/licenses\/LICENSE\-([0-9])\.([0-9])",
@@ -331,6 +437,10 @@ def get_license_type(path_license: str, default: Optional[str] = None) -> Option
     licenses_text = list(map(itemgetter(1), all_licenses))
     best_match = process.extract(
         license_content, licenses_text, scorer=token_sort_ratio
+    )
+    print_msg(
+        f"{Fore.YELLOW}Match percentage of the license is {int(best_match[0][1])}%. "
+        + "Low match percentage could mean that the license was modified."
     )
 
     if default and best_match[0][1] < 51:
